@@ -6,13 +6,13 @@ use actix_web::server::{HttpHandler, HttpServer};
 use mdns;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use serde_json;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use super::thing::Thing;
 use super::utils::get_ip;
 
 struct AppState {
-    things: Arc<Vec<Box<Thing>>>,
+    things: Arc<Vec<RwLock<Box<Thing>>>>,
 }
 
 impl AppState {
@@ -21,7 +21,7 @@ impl AppState {
     /// thing_id -- ID of the thing to get, in string form
     ///
     /// Returns the thing, or None if not found.
-    fn get_thing(&self, thing_id: Option<&str>) -> Option<&Box<Thing>> {
+    fn get_thing(&self, thing_id: Option<&str>) -> Option<&RwLock<Box<Thing>>> {
         if self.things.len() > 1 {
             if thing_id.is_none() {
                 return None;
@@ -50,7 +50,7 @@ impl AppState {
 fn things_handler_GET(req: HttpRequest<AppState>) -> HttpResponse {
     let mut response: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
     for thing in req.state().things.iter() {
-        response.push(thing.as_thing_description());
+        response.push(thing.read().unwrap().as_thing_description());
     }
     HttpResponse::Ok().json(response)
 }
@@ -59,10 +59,11 @@ fn things_handler_GET(req: HttpRequest<AppState>) -> HttpResponse {
 #[allow(non_snake_case)]
 fn thing_handler_GET(req: HttpRequest<AppState>) -> HttpResponse {
     let thing = req.state().get_thing(req.match_info().get("thing_id"));
-    if thing.is_none() {
-        HttpResponse::NotFound().finish()
-    } else {
-        HttpResponse::Ok().json(thing.unwrap().as_thing_description())
+    match thing {
+        None =>
+            HttpResponse::NotFound().finish(),
+        Some(thing) =>
+            HttpResponse::Ok().json(thing.read().unwrap().as_thing_description())
     }
 }
 
@@ -217,6 +218,7 @@ fn property_handler_GET(req: HttpRequest<AppState>) -> HttpResponse {
     }
 
     let property_name = property_name.unwrap();
+    let thing = thing.read().unwrap();
     if thing.has_property(property_name.to_string()) {
         HttpResponse::Ok()
             .json(json!({property_name: thing.get_property(property_name.to_string()).unwrap()}))
@@ -256,6 +258,7 @@ fn property_handler_PUT(
         return HttpResponse::BadRequest().finish();
     }
 
+    let mut thing = thing.write().unwrap();
     if thing.has_property(property_name.to_string()) {
         if thing
             .set_property(
@@ -279,10 +282,10 @@ fn property_handler_PUT(
 #[allow(non_snake_case)]
 fn actions_handler_GET(req: HttpRequest<AppState>) -> HttpResponse {
     let thing = req.state().get_thing(req.match_info().get("thing_id"));
-    if thing.is_none() {
-        HttpResponse::NotFound().finish()
-    } else {
-        HttpResponse::Ok().json(thing.unwrap().get_action_descriptions())
+    match thing {
+        None =>
+            HttpResponse::NotFound().finish(),
+        Some(thing) => HttpResponse::Ok().json(thing.read().unwrap().get_action_descriptions())
     }
 }
 
@@ -306,7 +309,7 @@ fn actions_handler_POST(
     for (action_name, action_params) in message.iter() {
         let input = action_params.get("input");
         let action = thing
-            .unwrap()
+            .unwrap().write().unwrap()
             .perform_action(action_name.to_string(), input);
         if action.is_some() {
             let mut action = action.unwrap();
@@ -351,7 +354,8 @@ fn action_id_handler_GET(req: HttpRequest<AppState>) -> HttpResponse {
         return HttpResponse::NotFound().finish();
     }
 
-    let action = thing.unwrap().get_action(
+    let thing = thing.unwrap().read().unwrap();
+    let action = thing.get_action(
         action_name.unwrap().to_string(),
         action_id.unwrap().to_string(),
     );
@@ -392,7 +396,7 @@ fn action_id_handler_DELETE(req: HttpRequest<AppState>) -> HttpResponse {
         return HttpResponse::NotFound().finish();
     }
 
-    if thing.unwrap().remove_action(
+    if thing.unwrap().write().unwrap().remove_action(
         action_name.unwrap().to_string(),
         action_id.unwrap().to_string(),
     ) {
@@ -409,7 +413,7 @@ fn events_handler_GET(req: HttpRequest<AppState>) -> HttpResponse {
     if thing.is_none() {
         HttpResponse::NotFound().finish()
     } else {
-        HttpResponse::Ok().json(thing.unwrap().get_event_descriptions())
+        HttpResponse::Ok().json(thing.unwrap().read().unwrap().get_event_descriptions())
     }
 }
 
@@ -430,7 +434,7 @@ pub struct WebThingServer {
     ip: String,
     port: u16,
     name: String,
-    things: Arc<Vec<Box<Thing>>>,
+    things: Arc<Vec<RwLock<Box<Thing>>>>,
     ssl_options: Option<(String, String)>,
     server: HttpServer<Box<HttpHandler>>,
     mdns: Option<mdns::Service>,
@@ -446,7 +450,7 @@ impl WebThingServer {
     /// port -- port to listen on (defaults to 80)
     /// ssl_options -- dict of SSL options to pass to the tornado server
     pub fn new(
-        mut things: Vec<Box<Thing>>,
+        mut things: Vec<RwLock<Box<Thing>>>,
         name: Option<String>,
         port: Option<u16>,
         ssl_options: Option<(String, String)>,
@@ -463,7 +467,7 @@ impl WebThingServer {
         };
 
         let name = if things.len() == 1 {
-            things[0].get_name()
+            things[0].read().unwrap().get_name()
         } else {
             name.unwrap()
         };
@@ -475,21 +479,22 @@ impl WebThingServer {
 
         if things.len() > 1 {
             for (idx, thing) in things.iter_mut().enumerate() {
+                let mut thing = thing.write().unwrap();
                 thing.set_href_prefix(format!("/{}", idx));
                 thing.set_ws_href(format!("{}://{}:{}/{}", ws_protocol, ip, port, idx));
             }
         } else {
-            things[0].set_ws_href(format!("{}://{}:{}", ws_protocol, ip, port));
+            things[0].write().unwrap().set_ws_href(format!("{}://{}:{}", ws_protocol, ip, port));
         }
 
-        let things = Arc::new(things);
-        let cloned = things.clone();
+        let thingsArc = Arc::new(things);
 
-        let server = if things.len() > 1 {
+        let server = if thingsArc.len() > 1 {
+            let innerArc = thingsArc.clone();
             server::new(move || {
                 vec![
                     App::with_state(AppState {
-                        things: cloned.clone(),
+                        things: innerArc.clone(),
                     }).middleware(middleware::Logger::default())
                         .resource("/", |r| r.get().f(things_handler_GET))
                         .resource("/{thing_id}", |r| r.get().f(thing_handler_GET))
@@ -526,10 +531,11 @@ impl WebThingServer {
                 ]
             })
         } else {
+            let innerArc = thingsArc.clone();
             server::new(move || {
                 vec![
                     App::with_state(AppState {
-                        things: cloned.clone(),
+                        things: innerArc.clone(),
                     }).middleware(middleware::Logger::default())
                         .resource("/", |r| r.get().f(thing_handler_GET))
                         .resource("/properties", |r| r.get().f(properties_handler_GET))
@@ -564,7 +570,7 @@ impl WebThingServer {
             ip: ip,
             port: port,
             name: name,
-            things: things.clone(),
+            things: thingsArc.clone(),
             ssl_options: ssl_options,
             server: server
                 .bind(format!("0.0.0.0:{}", port))
